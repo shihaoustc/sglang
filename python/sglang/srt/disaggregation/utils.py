@@ -511,25 +511,29 @@ def get_kv_class(
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
 
 
+def _get_cp_rank_page_bounds(
+    total_pages: int, cp_rank: int, cp_size: int
+) -> Tuple[int, int]:
+    base = total_pages // cp_size
+    rem = total_pages % cp_size
+    local_start = cp_rank * base + min(cp_rank, rem)
+    n_pages = base + (1 if cp_rank < rem else 0)
+    return local_start, local_start + n_pages
+
+
 def page_indices_to_cp_rank_page_indices(
     page_indices: np.ndarray,
     total_pages: int,
     cp_rank: int,
     cp_size: int,
+    page_offset: int = 0,
 ) -> np.ndarray:
     """
-    Filter page_indices (which are *global* page ids in the KV pool) to those
-    belonging to the given CP rank for this request.
+    Return the subset of page_indices assigned to this CP rank by request
+    position, not by the numeric value of global page ids.
 
-    For a single request, its pages occupy a contiguous global range
-    [first_page, first_page + total_pages). We first compute the local
-    split [0, total_pages) across cp_size ranks, then shift that local
-    range by first_page back into the global page id space and take
-    the intersection with page_indices.
-
-    Returns:
-        Subset of page_indices that fall in this rank's global
-        [start_page, end_page) slice for the given CP rank.
+    page_indices may be a chunk of the request's pages. page_offset is the
+    chunk's start position in the full request page list.
     """
     if cp_size <= 1:
         return page_indices
@@ -537,58 +541,46 @@ def page_indices_to_cp_rank_page_indices(
     if page_indices.size == 0:
         return np.asarray(page_indices)
 
-    first_page = int(page_indices.min())
-    base = total_pages // cp_size
-    rem = total_pages % cp_size
-
-    if rem == 0:
-        local_start = cp_rank * base
-        local_end = local_start + base
-    else:
-        local_start = cp_rank * base + min(cp_rank, rem)
-        n_pages = base + (1 if cp_rank < rem else 0)
-        local_end = local_start + n_pages
-
-    # Map back to global page ids.
-    start_page = first_page + local_start
-    end_page = first_page + local_end
-
-    mask = (page_indices >= start_page) & (page_indices < end_page)
-    return np.asarray(page_indices)[mask]
+    rank_start, rank_end = _get_cp_rank_page_bounds(total_pages, cp_rank, cp_size)
+    chunk_start = page_offset
+    chunk_end = page_offset + len(page_indices)
+    start = max(rank_start, chunk_start) - chunk_start
+    end = min(rank_end, chunk_end) - chunk_start
+    if end <= start:
+        return np.asarray(page_indices[:0])
+    return np.asarray(page_indices[start:end])
 
 
 def filter_kv_indices_for_cp_rank(
-    kv_mgr: CommonKVManager, kv_indices: np.ndarray, index_slice: slice
+    kv_mgr: CommonKVManager,
+    kv_indices: np.ndarray,
+    index_slice: slice,
+    total_pages: Optional[int] = None,
 ) -> Tuple[np.ndarray, slice]:
     """Filters kv_indices and index_slice for the current CP rank."""
-    total_pages = len(kv_indices)
+    if total_pages is None:
+        total_pages = len(kv_indices)
     cp_rank = kv_mgr.attn_cp_rank
     cp_size = kv_mgr.attn_cp_size
 
-    rank_page_indices = page_indices_to_cp_rank_page_indices(
-        page_indices=kv_indices,
-        total_pages=total_pages,
-        cp_rank=cp_rank,
-        cp_size=cp_size,
-    )
+    if cp_size <= 1:
+        return kv_indices, index_slice
 
-    if rank_page_indices.size == 0:
+    rank_start, rank_end = _get_cp_rank_page_bounds(total_pages, cp_rank, cp_size)
+    chunk_start = index_slice.start
+    chunk_end = index_slice.stop
+    first_pos = max(rank_start, chunk_start) - chunk_start
+    last_pos = min(rank_end, chunk_end) - chunk_start
+
+    if last_pos <= first_pos:
         new_kv_indices = kv_indices[:0]
         new_index_slice = slice(index_slice.start, index_slice.start)
     else:
-        mask = np.isin(kv_indices, rank_page_indices)
-        if not mask.any():
-            new_kv_indices = kv_indices[:0]
-            new_index_slice = slice(index_slice.start, index_slice.start)
-        else:
-            first_pos = int(mask.argmax())
-            last_pos = len(mask) - int(mask[::-1].argmax())
-
-            new_kv_indices = kv_indices[first_pos:last_pos]
-            new_index_slice = slice(
-                index_slice.start + first_pos,
-                index_slice.start + last_pos,
-            )
+        new_kv_indices = kv_indices[first_pos:last_pos]
+        new_index_slice = slice(
+            index_slice.start + first_pos,
+            index_slice.start + last_pos,
+        )
     return new_kv_indices, new_index_slice
 
 
